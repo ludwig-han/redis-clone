@@ -1,0 +1,15 @@
+SET name hotaek
+GET name
+EXISTS name
+DEL name
+GET name
+EXISTS name
+
+SET a 1
+SET b 2
+EXISTS a b c
+DEL a b c
+
+GET missing
+SET 한글 값
+GET 한글

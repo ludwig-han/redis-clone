@@ -2,6 +2,10 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+type Store = Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>;
+
 /// 진짜 Redis가 6379를 쓰기 때문에 우리는 6380을 씁니다.
 const DEFAULT_PORT: u16 = 6380;
 
@@ -21,13 +25,18 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    let store: Store = Arc::new(Mutex::new(HashMap::new()));
+
     eprintln!("포트 {port} 에서 연결을 기다립니다");
 
     for incoming in listener.incoming() {
         match incoming {
             // 커넥션 하나당 스레드 하나. 한 커넥션이 막혀도 다른 커넥션은 계속 처리됩니다.
             Ok(stream) => {
-                thread::spawn(move || handle_connection(stream));
+                let store = Arc::clone(&store);
+
+                thread::spawn(move || handle_connection(stream, store));
             }
             // 연결 하나를 못 받았다고 서버를 끄지 않습니다.
             Err(error) => eprintln!("연결을 수락하지 못했습니다: {error}"),
@@ -56,7 +65,7 @@ fn port_from_args() -> Result<u16, String> {
     Ok(port)
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(mut stream: TcpStream, store: Store) {
     // 읽은 바이트를 모아두는 버퍼입니다.
     // TCP는 메시지 단위가 아니라 바이트 흐름이라, 명령 하나가 여러 번에 나눠 도착할 수 있습니다.
     let mut buffer = Vec::new();
@@ -83,7 +92,7 @@ fn handle_connection(mut stream: TcpStream) {
             };
             buffer.drain(..consumed);
 
-            let reply = build_reply(&command);
+            let reply = build_reply(&command, &store);
             if reply.is_empty() {
                 continue;
             }
@@ -166,7 +175,7 @@ fn parse_number(bytes: &[u8]) -> Option<i64> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
-fn build_reply(command: &[Vec<u8>]) -> Vec<u8> {
+fn build_reply(command: &[Vec<u8>], store: &Store) -> Vec<u8> {
     // 빈 배열(`*0\r\n`)에는 진짜 Redis도 아무 응답을 하지 않습니다.
     let Some(name) = command.first() else {
         return Vec::new();
@@ -185,6 +194,76 @@ fn build_reply(command: &[Vec<u8>]) -> Vec<u8> {
             2 => bulk_string(&command[1]),
             _ => error_reply(b"ERR wrong number of arguments for 'echo' command"),
         };
+    }
+
+    if name.eq_ignore_ascii_case(b"SET") {
+        if command.len() != 3 {
+            return error_reply(b"ERR wrong number of arguments for 'set' command");
+        }
+
+        let mut store = match store.lock() {
+            Ok(store) => store,
+            Err(_) => return error_reply(b"ERR internal server error"),
+        };
+
+        store.insert(command[1].clone(), command[2].clone());
+
+        return b"+OK\r\n".to_vec();
+    }
+
+    if name.eq_ignore_ascii_case(b"GET") {
+        if command.len() != 2 {
+            return error_reply(b"ERR wrong number of arguments for 'get' command");
+        }
+
+        let store = match store.lock() {
+            Ok(store) => store,
+            Err(_) => return error_reply(b"ERR internal server error"),
+        };
+
+        return match store.get(&command[1]) {
+            Some(value) => bulk_string(value),
+            None => b"$-1\r\n".to_vec(),
+        };
+    }
+
+    if name.eq_ignore_ascii_case(b"DEL") {
+        if command.len() < 2 {
+            return error_reply(b"ERR wrong number of arguments for 'del' command");
+        }
+
+        let mut store = match store.lock() {
+            Ok(store) => store,
+            Err(_) => return error_reply(b"ERR internal server error"),
+        };
+
+        let mut removed = 0;
+
+        for key in &command[1..] {
+            if store.remove(key).is_some() {
+                removed += 1;
+            }
+        }
+
+        return format!(":{removed}\r\n").into_bytes();
+    }
+
+    if name.eq_ignore_ascii_case(b"EXISTS") {
+        if command.len() < 2 {
+            return error_reply(b"ERR wrong number of arguments for 'exists' command");
+        }
+
+        let store = match store.lock() {
+            Ok(store) => store,
+            Err(_) => return error_reply(b"ERR internal server error"),
+        };
+
+        let count = command[1..]
+            .iter()
+            .filter(|key| store.contains_key(*key))
+            .count();
+
+        return format!(":{count}\r\n").into_bytes();
     }
 
     unknown_command_reply(command)
@@ -224,6 +303,9 @@ fn unknown_command_reply(command: &[Vec<u8>]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_store() -> Store {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     fn complete(buffer: &[u8]) -> (Vec<Vec<u8>>, usize) {
         match parse_command(buffer) {
@@ -254,14 +336,23 @@ mod tests {
 
     #[test]
     fn ping_응답이_진짜_redis와_같다() {
-        assert_eq!(build_reply(&[b"PING".to_vec()]), b"+PONG\r\n".to_vec());
-        assert_eq!(build_reply(&[b"ping".to_vec()]), b"+PONG\r\n".to_vec());
         assert_eq!(
-            build_reply(&[b"PING".to_vec(), b"hello".to_vec()]),
+            build_reply(&[b"PING".to_vec()], &test_store()),
+            b"+PONG\r\n".to_vec()
+        );
+        assert_eq!(
+            build_reply(&[b"ping".to_vec()], &test_store()),
+            b"+PONG\r\n".to_vec()
+        );
+        assert_eq!(
+            build_reply(&[b"PING".to_vec(), b"hello".to_vec()], &test_store()),
             b"$5\r\nhello\r\n".to_vec()
         );
         assert_eq!(
-            build_reply(&[b"PING".to_vec(), b"a".to_vec(), b"b".to_vec()]),
+            build_reply(
+                &[b"PING".to_vec(), b"a".to_vec(), b"b".to_vec()],
+                &test_store()
+            ),
             b"-ERR wrong number of arguments for 'ping' command\r\n".to_vec()
         );
     }
@@ -269,11 +360,14 @@ mod tests {
     #[test]
     fn 모르는_커맨드_문구가_진짜_redis와_같다() {
         assert_eq!(
-            build_reply(&[b"garbage".to_vec()]),
+            build_reply(&[b"garbage".to_vec()], &test_store()),
             b"-ERR unknown command 'garbage'\r\n".to_vec()
         );
         assert_eq!(
-            build_reply(&[b"foo".to_vec(), b"a".to_vec(), b"b".to_vec()]),
+            build_reply(
+                &[b"foo".to_vec(), b"a".to_vec(), b"b".to_vec()],
+                &test_store()
+            ),
             b"-ERR unknown command 'foo', with args beginning with: 'a' 'b' \r\n".to_vec()
         );
     }
@@ -281,22 +375,28 @@ mod tests {
     #[test]
     fn echo_응답이_진짜_redis와_같다() {
         assert_eq!(
-            build_reply(&[b"ECHO".to_vec(), b"hello".to_vec()]),
+            build_reply(&[b"ECHO".to_vec(), b"hello".to_vec()], &test_store()),
             b"$5\r\nhello\r\n".to_vec()
         );
 
         assert_eq!(
-            build_reply(&[b"echo".to_vec(), "한글".as_bytes().to_vec()]),
+            build_reply(
+                &[b"echo".to_vec(), "한글".as_bytes().to_vec()],
+                &test_store()
+            ),
             "$6\r\n한글\r\n".as_bytes().to_vec()
         );
 
         assert_eq!(
-            build_reply(&[b"ECHO".to_vec()]),
+            build_reply(&[b"ECHO".to_vec()], &test_store()),
             b"-ERR wrong number of arguments for 'echo' command\r\n".to_vec()
         );
 
         assert_eq!(
-            build_reply(&[b"ECHO".to_vec(), b"a".to_vec(), b"b".to_vec()]),
+            build_reply(
+                &[b"ECHO".to_vec(), b"a".to_vec(), b"b".to_vec()],
+                &test_store()
+            ),
             b"-ERR wrong number of arguments for 'echo' command\r\n".to_vec()
         );
     }
