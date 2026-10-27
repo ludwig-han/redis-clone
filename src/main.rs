@@ -26,6 +26,8 @@ fn main() {
         }
     };
 
+    // Arc: 여러 thread가 같은 데이터를 같이 가리킬 수 있게 해주는 공유용 포인터
+    // Mutex: 한 번에 한 thread만 데이터를 바꿀 수 있게 해주는 잠금 장치
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
 
     eprintln!("포트 {port} 에서 연결을 기다립니다");
@@ -34,6 +36,7 @@ fn main() {
         match incoming {
             // 커넥션 하나당 스레드 하나. 한 커넥션이 막혀도 다른 커넥션은 계속 처리됩니다.
             Ok(stream) => {
+                // 같은 실제 데이터를 가리키는 '손잡이'를 하나 더 만듭니다. Arc::clone 은 데이터를 복사하지 않고, Arc 내부의 카운터만 증가시킵니다.
                 let store = Arc::clone(&store);
 
                 thread::spawn(move || handle_connection(stream, store));
@@ -44,6 +47,7 @@ fn main() {
     }
 }
 
+/// --port 1234 같은 인자를 처리합니다. 없으면 DEFAULT_PORT를 씁니다.
 fn port_from_args() -> Result<u16, String> {
     let mut args = std::env::args().skip(1);
     let mut port = DEFAULT_PORT;
@@ -86,8 +90,7 @@ fn handle_connection(mut stream: TcpStream, store: Store) {
             let (command, consumed) = match parse_command(&buffer) {
                 Parsed::Complete(command, consumed) => (command, consumed),
                 Parsed::Incomplete => break, // 뒷부분이 아직 안 왔습니다. 더 읽습니다
-                // 형식이 깨지면 연결을 끊습니다. 진짜 Redis는 구체적인 문구도 함께 보내는데,
-                // 그건 파서를 제대로 만드는 S2에서 맞춥니다.
+                // 형식이 깨지면 연결을 끊습니다. 진짜 Redis는 구체적인 문구도 함께 보냅니다.
                 Parsed::Broken => return,
             };
             buffer.drain(..consumed);
@@ -115,7 +118,7 @@ enum Parsed {
 }
 
 /// redis-cli 는 명령을 RESP 배열로 보냅니다: `*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n`
-/// 진짜 Redis는 `nc` 로 친 생 텍스트(인라인 명령)도 받아주는데, 그건 S2 몫입니다.
+/// 진짜 Redis는 `nc` 로 친 생 텍스트(인라인 명령)도 받아줍니다.
 fn parse_command(buffer: &[u8]) -> Parsed {
     match buffer.first() {
         None => Parsed::Incomplete,
@@ -124,6 +127,7 @@ fn parse_command(buffer: &[u8]) -> Parsed {
     }
 }
 
+// `*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n` 같은 RESP 배열을 파싱합니다.
 fn parse_array(buffer: &[u8]) -> Parsed {
     let Some((header, mut offset)) = read_line(buffer, 0) else {
         return Parsed::Incomplete;
@@ -175,6 +179,7 @@ fn parse_number(bytes: &[u8]) -> Option<i64> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
+// 명령어에 따라 적절한 응답을 만듭니다.
 fn build_reply(command: &[Vec<u8>], store: &Store) -> Vec<u8> {
     // 빈 배열(`*0\r\n`)에는 진짜 Redis도 아무 응답을 하지 않습니다.
     let Some(name) = command.first() else {
@@ -201,6 +206,9 @@ fn build_reply(command: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return error_reply(b"ERR wrong number of arguments for 'set' command");
         }
 
+        // MutexGuard 를 얻는 과정에서 에러가 나면, 내부 서버 에러를 돌려주고 연결을 끊습니다.
+        // MutexGuard 는 store.lock() 이 성공하면 얻는, Mutex 내부의 데이터를 안전하게 다룰 수 있는 '손잡이'입니다.
+        // MutexGuard 는 스코프를 벗어나면 drop 되어 자동으로 잠금이 풀립니다.
         let mut store = match store.lock() {
             Ok(store) => store,
             Err(_) => return error_reply(b"ERR internal server error"),
