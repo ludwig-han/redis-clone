@@ -1,13 +1,26 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-type Store = Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>;
+type Store = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
 
 /// 진짜 Redis가 6379를 쓰기 때문에 우리는 6380을 씁니다.
 const DEFAULT_PORT: u16 = 6380;
+
+struct Entry {
+    value: Vec<u8>,
+    expires_at: Option<Instant>,
+}
+
+fn is_expired(entry: &Entry) -> bool {
+    match entry.expires_at {
+        Some(expires_at) => Instant::now() >= expires_at,
+        None => false,
+    }
+}
 
 fn main() {
     let port = match port_from_args() {
@@ -202,19 +215,101 @@ fn build_reply(command: &[Vec<u8>], store: &Store) -> Vec<u8> {
     }
 
     if name.eq_ignore_ascii_case(b"SET") {
-        if command.len() != 3 {
+        if command.len() < 3 {
             return error_reply(b"ERR wrong number of arguments for 'set' command");
         }
 
-        // MutexGuard 를 얻는 과정에서 에러가 나면, 내부 서버 에러를 돌려주고 연결을 끊습니다.
-        // MutexGuard 는 store.lock() 이 성공하면 얻는, Mutex 내부의 데이터를 안전하게 다룰 수 있는 '손잡이'입니다.
-        // MutexGuard 는 스코프를 벗어나면 drop 되어 자동으로 잠금이 풀립니다.
+        let mut ttl: Option<Duration> = None;
+        let mut nx = false;
+        let mut xx = false;
+
+        let mut i = 3;
+
+        while i < command.len() {
+            if command[i].eq_ignore_ascii_case(b"EX") {
+                if ttl.is_some() || i + 1 >= command.len() {
+                    return error_reply(b"ERR syntax error");
+                }
+
+                let seconds = match std::str::from_utf8(&command[i + 1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(seconds) if seconds > 0 => seconds,
+                    _ => return error_reply(b"ERR invalid expire time in 'set' command"),
+                };
+
+                ttl = Some(Duration::from_secs(seconds as u64));
+                i += 2; // 다음 옵션으로 넘어갑니다.
+            } else if command[i].eq_ignore_ascii_case(b"PX") {
+                if ttl.is_some() || i + 1 >= command.len() {
+                    return error_reply(b"ERR syntax error");
+                }
+
+                let milliseconds = match std::str::from_utf8(&command[i + 1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(milliseconds) if milliseconds > 0 => milliseconds,
+                    _ => return error_reply(b"ERR invalid expire time in 'set' command"),
+                };
+
+                ttl = Some(Duration::from_millis(milliseconds as u64));
+                i += 2;
+            } else if command[i].eq_ignore_ascii_case(b"NX") {
+                if nx || xx {
+                    // NX와 XX는 동시에 사용할 수 없습니다.
+                    return error_reply(b"ERR syntax error");
+                }
+
+                nx = true;
+                i += 1;
+            } else if command[i].eq_ignore_ascii_case(b"XX") {
+                if nx || xx {
+                    return error_reply(b"ERR syntax error");
+                }
+
+                xx = true;
+                i += 1;
+            } else {
+                return error_reply(b"ERR syntax error");
+            }
+        }
+
         let mut store = match store.lock() {
             Ok(store) => store,
             Err(_) => return error_reply(b"ERR internal server error"),
         };
 
-        store.insert(command[1].clone(), command[2].clone());
+        let key = &command[1];
+
+        // 만료된 키가 HashMap에 남아 있을 수 있으므로,
+        // NX/XX 판단 전에 lazy expiration으로 먼저 제거한다.
+        // 그렇지 않으면 만료된 키를 존재하는 것으로 잘못 판단할 수 있다.
+        if store.get(key).is_some_and(is_expired) {
+            store.remove(key);
+        }
+
+        let exists = store.contains_key(key);
+
+        if nx && exists {
+            return b"$-1\r\n".to_vec();
+        }
+
+        if xx && !exists {
+            return b"$-1\r\n".to_vec();
+        }
+
+        // TTL이 설정되어 있으면 expires_at을 계산하고, 없으면 None으로 설정합니다.
+        let expires_at = ttl.map(|duration| Instant::now() + duration);
+
+        store.insert(
+            key.clone(),
+            Entry {
+                value: command[2].clone(),
+                expires_at,
+            },
+        );
 
         return b"+OK\r\n".to_vec();
     }
@@ -224,15 +319,137 @@ fn build_reply(command: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return error_reply(b"ERR wrong number of arguments for 'get' command");
         }
 
-        let store = match store.lock() {
+        let mut store = match store.lock() {
             Ok(store) => store,
             Err(_) => return error_reply(b"ERR internal server error"),
         };
 
-        return match store.get(&command[1]) {
-            Some(value) => bulk_string(value),
+        let key = &command[1];
+
+        if store.get(key).is_some_and(is_expired) {
+            store.remove(key);
+            return b"$-1\r\n".to_vec();
+        }
+
+        return match store.get(key) {
+            Some(entry) => bulk_string(&entry.value),
             None => b"$-1\r\n".to_vec(),
         };
+    }
+
+    // EXPIRE 명령은 key가 존재하지 않으면 0을, 성공하면 1을 돌려줍니다.
+    if name.eq_ignore_ascii_case(b"EXPIRE") {
+        if command.len() != 3 {
+            return error_reply(b"ERR wrong number of arguments for 'expire' command");
+        }
+
+        // seconds 인자를 i64로 파싱합니다. 음수도 허용합니다.
+        let seconds = match std::str::from_utf8(&command[2])
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(seconds) => seconds,
+            None => return error_reply(b"ERR value is not an integer or out of range"),
+        };
+
+        let mut store = match store.lock() {
+            Ok(store) => store,
+            Err(_) => return error_reply(b"ERR internal server error"),
+        };
+
+        let key = &command[1];
+
+        if store.get(key).is_some_and(is_expired) {
+            // 만료된 키는 삭제하고 0을 반환
+            store.remove(key);
+            return b":0\r\n".to_vec();
+        }
+
+        let Some(entry) = store.get_mut(key) else {
+            return b":0\r\n".to_vec();
+        };
+
+        if seconds <= 0 {
+            store.remove(key);
+            return b":1\r\n".to_vec();
+        }
+
+        // seconds가 양수이면 expires_at을 설정합니다.
+        entry.expires_at = Some(Instant::now() + Duration::from_secs(seconds as u64));
+
+        return b":1\r\n".to_vec();
+    }
+
+    // TTL 명령은 key가 존재하지 않으면 -2를, 만료되지 않은 키는 -1을, 만료된 키는 0 이상을 돌려줍니다.
+    if name.eq_ignore_ascii_case(b"TTL") {
+        if command.len() != 2 {
+            return error_reply(b"ERR wrong number of arguments for 'ttl' command");
+        }
+
+        let mut store = match store.lock() {
+            Ok(store) => store,
+            Err(_) => return error_reply(b"ERR internal server error"),
+        };
+
+        let key = &command[1];
+        let now = Instant::now();
+
+        // 만료된 키는 삭제하고 -2를 반환
+        if store
+            .get(key)
+            .is_some_and(|entry| entry.expires_at.is_some_and(|expires_at| now >= expires_at))
+        {
+            store.remove(key);
+            return b":-2\r\n".to_vec();
+        }
+
+        // key가 존재하지 않으면 -2를 반환
+        let Some(entry) = store.get(key) else {
+            return b":-2\r\n".to_vec();
+        };
+
+        // expires_at이 없으면 -1을 반환
+        let Some(expires_at) = entry.expires_at else {
+            return b":-1\r\n".to_vec();
+        };
+
+        // 남은 시간을 초 단위로 계산하여 반환
+        let remaining = expires_at.duration_since(now);
+        let ttl = (remaining.as_millis() + 500) / 1000;
+
+        return format!(":{ttl}\r\n").into_bytes();
+    }
+
+    // PERSIST 명령은 key가 존재하지 않으면 0을, 만료되지 않은 키는 0을, 만료된 키는 1을 돌려줍니다.
+    if name.eq_ignore_ascii_case(b"PERSIST") {
+        if command.len() != 2 {
+            return error_reply(b"ERR wrong number of arguments for 'persist' command");
+        }
+
+        let mut store = match store.lock() {
+            Ok(store) => store,
+            Err(_) => return error_reply(b"ERR internal server error"),
+        };
+
+        let key = &command[1];
+
+        // 만료된 키는 삭제하고 0을 반환
+        if store.get(key).is_some_and(is_expired) {
+            store.remove(key);
+            return b":0\r\n".to_vec();
+        }
+
+        // key가 존재하지 않으면 0을 반환
+        let Some(entry) = store.get_mut(key) else {
+            return b":0\r\n".to_vec();
+        };
+
+        // expires_at이 있으면 제거하고 1을 반환, 없으면 0을 반환
+        if entry.expires_at.take().is_some() {
+            return b":1\r\n".to_vec();
+        }
+
+        return b":0\r\n".to_vec();
     }
 
     if name.eq_ignore_ascii_case(b"DEL") {
@@ -248,6 +465,12 @@ fn build_reply(command: &[Vec<u8>], store: &Store) -> Vec<u8> {
         let mut removed = 0;
 
         for key in &command[1..] {
+            // 만료된 키는 제거하고 건너뜁니다.
+            if store.get(key).is_some_and(is_expired) {
+                store.remove(key);
+                continue;
+            }
+
             if store.remove(key).is_some() {
                 removed += 1;
             }
@@ -261,16 +484,24 @@ fn build_reply(command: &[Vec<u8>], store: &Store) -> Vec<u8> {
             return error_reply(b"ERR wrong number of arguments for 'exists' command");
         }
 
-        let store = match store.lock() {
+        let mut store = match store.lock() {
             Ok(store) => store,
             Err(_) => return error_reply(b"ERR internal server error"),
         };
 
-        let count = command[1..]
-            .iter()
-            .filter(|key| store.contains_key(*key))
-            .count();
+        let mut count = 0;
 
+        for key in &command[1..] {
+            // 만료된 키는 제거하고 건너뜁니다.
+            if store.get(key).is_some_and(is_expired) {
+                store.remove(key);
+                continue;
+            }
+
+            if store.contains_key(key) {
+                count += 1;
+            }
+        }
         return format!(":{count}\r\n").into_bytes();
     }
 
