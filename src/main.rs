@@ -189,7 +189,52 @@ fn read_line(buffer: &[u8], from: usize) -> Option<(&[u8], usize)> {
 }
 
 fn parse_number(bytes: &[u8]) -> Option<i64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
+    std::str::from_utf8(bytes).ok()?.parse().ok() // from_utf8와 parse를 연달아 시도합니다. 어느 쪽이 실패해도 None을 돌려줍니다.
+}
+
+fn increment_by(store: &Store, key: &[u8], amount: i64) -> Vec<u8> {
+    let mut store = match store.lock() {
+        Ok(store) => store,
+        Err(_) => return error_reply(b"ERR internal server error"),
+    };
+
+    // 만료된 키는 없는 키로 취급합니다.
+    if store.get(key).is_some_and(is_expired) {
+        store.remove(key);
+    }
+
+    // 기존 값이 있으면 숫자로 변환하고,
+    // 키가 없으면 Redis 규칙에 따라 0부터 시작합니다.
+    let current = match store.get(key) {
+        Some(entry) => match parse_number(&entry.value) {
+            Some(value) => value,
+            None => return error_reply(b"ERR value is not an integer or out of range"),
+        },
+        None => 0,
+    };
+
+    // amount를 더하되 i64 overflow를 검사합니다.
+    let Some(next) = current.checked_add(amount) else {
+        return error_reply(b"ERR increment or decrement would overflow");
+    };
+
+    // 기존 키라면 value만 바꿔 TTL을 유지합니다.
+    match store.get_mut(key) {
+        Some(entry) => {
+            entry.value = next.to_string().into_bytes();
+        }
+        None => {
+            store.insert(
+                key.to_vec(),
+                Entry {
+                    value: next.to_string().into_bytes(),
+                    expires_at: None,
+                },
+            );
+        }
+    }
+
+    format!(":{next}\r\n").into_bytes()
 }
 
 // 명령어에 따라 적절한 응답을 만듭니다.
@@ -503,6 +548,35 @@ fn build_reply(command: &[Vec<u8>], store: &Store) -> Vec<u8> {
             }
         }
         return format!(":{count}\r\n").into_bytes();
+    }
+
+    if name.eq_ignore_ascii_case(b"INCR") {
+        if command.len() != 2 {
+            return error_reply(b"ERR wrong number of arguments for 'incr' command");
+        }
+
+        return increment_by(store, &command[1], 1);
+    }
+
+    if name.eq_ignore_ascii_case(b"DECR") {
+        if command.len() != 2 {
+            return error_reply(b"ERR wrong number of arguments for 'decr' command");
+        }
+
+        return increment_by(store, &command[1], -1);
+    }
+
+    if name.eq_ignore_ascii_case(b"INCRBY") {
+        if command.len() != 3 {
+            return error_reply(b"ERR wrong number of arguments for 'incrby' command");
+        }
+
+        let amount = match parse_number(&command[2]) {
+            Some(value) => value,
+            None => return error_reply(b"ERR value is not an integer or out of range"),
+        };
+
+        return increment_by(store, &command[1], amount);
     }
 
     unknown_command_reply(command)
