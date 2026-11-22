@@ -1,0 +1,61 @@
+# S06 첫 단계: LPUSH만 구현합니다. LRANGE 등 나머지 List 명령은 다음 단계입니다.
+# difftest의 FLUSHALL은 현재 clone에 없으므로 이 파일에서 쓰는 키를 명시적으로 정리합니다.
+DEL s06-jobs s06-str s06-ttl s06-expired s06-expired-list s06-arity
+
+# 새 리스트, 여러 원소, 대소문자, 한글, 기존 리스트에 추가
+LPUSH s06-jobs a b c
+lpush s06-jobs 한글
+LPUSH s06-jobs d e
+EXISTS s06-jobs
+TTL s06-jobs
+
+# 인자 부족: 키를 만들지 않습니다.
+LPUSH
+LPUSH s06-arity
+EXISTS s06-arity
+
+# 문자열 키에 LPUSH하면 실패하고 기존 값은 유지됩니다.
+SET s06-str old
+LPUSH s06-str a b
+GET s06-str
+
+# 리스트 키에 문자열 조회/숫자 연산을 하면 WRONGTYPE입니다.
+GET s06-jobs
+INCR s06-jobs
+DECR s06-jobs
+INCRBY s06-jobs 2
+LPUSH s06-jobs f
+
+# 리스트의 원소를 바꾸어도 키의 TTL은 유지됩니다.
+LPUSH s06-ttl a
+EXPIRE s06-ttl 60
+LPUSH s06-ttl b c
+TTL s06-ttl
+PERSIST s06-ttl
+TTL s06-ttl
+
+# NX는 기존 리스트를 보존하고 XX/일반 SET은 문자열로 교체합니다.
+SET s06-jobs replacement NX
+LPUSH s06-jobs g
+SET s06-jobs replacement XX
+GET s06-jobs
+LPUSH s06-ttl z
+SET s06-ttl replacement
+GET s06-ttl
+
+# 만료된 문자열도 없는 키이므로 새 리스트를 만들 수 있습니다.
+SET s06-expired old PX 100
+SLEEP 0.2
+LPUSH s06-expired new
+TTL s06-expired
+
+# 만료된 리스트는 예전 원소를 포함하지 않고 길이 1부터 시작합니다.
+LPUSH s06-expired-list old older
+EXPIRE s06-expired-list 1
+SLEEP 1.2
+LPUSH s06-expired-list new
+TTL s06-expired-list
+
+# DEL/EXISTS는 값 종류와 무관하게 동작합니다.
+DEL s06-jobs s06-str s06-ttl s06-expired s06-expired-list
+EXISTS s06-jobs s06-str s06-ttl s06-expired s06-expired-list
