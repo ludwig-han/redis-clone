@@ -1,0 +1,32 @@
+SET a 1
+TTL a
+EXPIRE a 10
+TTL a
+PERSIST a
+TTL a
+
+EXPIRE missing 10
+TTL missing
+PERSIST missing
+
+SET ex-key hello EX 1
+GET ex-key
+SLEEP 1.2
+GET ex-key
+TTL ex-key
+
+SET px-key hello PX 500
+GET px-key
+SLEEP 0.6
+GET px-key
+
+SET nx-key first NX
+GET nx-key
+SET nx-key second NX
+GET nx-key
+
+SET xx-key first XX
+GET xx-key
+SET xx-key first
+SET xx-key second XX
+GET xx-key

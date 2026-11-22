@@ -1,0 +1,28 @@
+SET count 10
+INCR count
+GET count
+
+DECR count
+GET count
+
+INCRBY count 5
+GET count
+
+INCRBY count -3
+GET count
+
+INCR missing
+GET missing
+
+SET bad hello
+INCR bad
+
+SET max 9223372036854775807
+INCR max
+
+SET min -9223372036854775808
+DECR min
+
+SET ttl-count 10 EX 10
+INCR ttl-count
+TTL ttl-count

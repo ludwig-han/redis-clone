@@ -1,0 +1,127 @@
+# S06 전체: 양끝 삽입/삭제, 범위 조회, 길이, 타입 및 TTL
+DEL s06-all s06-empty s06-bad s06-exp s06-overwrite
+RPUSH s06-all a b c
+LLEN s06-all
+LRANGE s06-all 0 -1
+LPUSH s06-all d e
+RPUSH s06-all f g
+LRANGE s06-all 0 -1
+LRANGE s06-all 0 0
+LRANGE s06-all 1 3
+LRANGE s06-all -3 -1
+LRANGE s06-all -100 1
+LRANGE s06-all 0 -100
+LRANGE s06-all 100 200
+LRANGE s06-all 2 1
+LRANGE s06-all -9223372036854775808 9223372036854775807
+LRANGE s06-all 9223372036854775807 9223372036854775807
+LRANGE s06-all 0 -9223372036854775808
+LRANGE s06-all 0 01
+LRANGE s06-all +1 -1
+LRANGE s06-all -0 -1
+LRANGE s06-all nope -1
+LRANGE s06-all 0 9223372036854775808
+LRANGE s06-all
+LRANGE s06-all 0
+LRANGE s06-all 0 -1 extra
+LLEN
+LLEN s06-all extra
+RPUSH
+RPUSH s06-empty
+EXISTS s06-empty
+
+# count 유무에 따른 응답 타입 차이는 단위 테스트와 원시 RESP 비교에서도 검증합니다.
+LPOP s06-all
+RPOP s06-all
+LRANGE s06-all 0 -1
+LPOP s06-all 2
+RPOP s06-all 1
+LRANGE s06-all 0 -1
+LPOP s06-all 0
+LLEN s06-all
+RPOP s06-all 9223372036854775807
+EXISTS s06-all
+TTL s06-all
+LLEN s06-all
+LRANGE s06-all 0 -1
+LPOP s06-all
+RPOP s06-all
+LPOP s06-all 1
+RPOP s06-all 0
+LPOP s06-all -1
+RPOP s06-all hello
+LPOP s06-all +1
+RPOP s06-all 01
+LPOP s06-all -0
+RPOP s06-all 9223372036854775808
+LPOP
+RPOP
+LPOP s06-all 1 extra
+RPOP s06-all 1 extra
+
+# 모든 List 명령의 WRONGTYPE와 오류 발생 시 값 보존
+SET s06-bad original
+LPUSH s06-bad x
+RPUSH s06-bad x
+LPOP s06-bad
+RPOP s06-bad
+LPOP s06-bad 0
+RPOP s06-bad 2
+LRANGE s06-bad 0 -1
+LLEN s06-bad
+LPOP s06-bad invalid
+LRANGE s06-bad invalid -1
+GET s06-bad
+
+# 원소 수정과 조회는 TTL을 유지하고 마지막 POP은 키까지 제거
+RPUSH s06-all a b c d
+EXPIRE s06-all 60
+RPUSH s06-all e
+TTL s06-all
+LPOP s06-all
+TTL s06-all
+RPOP s06-all 2
+TTL s06-all
+LRANGE s06-all 0 -1
+TTL s06-all
+PERSIST s06-all
+TTL s06-all
+EXPIRE s06-all 60
+LPOP s06-all 99
+TTL s06-all
+EXISTS s06-all
+SET s06-all reused NX
+GET s06-all
+
+# 문자열의 만료 후 RPUSH로 리스트 재생성
+SET s06-exp old PX 100
+SLEEP 0.2
+RPUSH s06-exp new
+LRANGE s06-exp 0 -1
+TTL s06-exp
+
+# 리스트 만료 후 조회와 삭제는 없는 키와 동일
+EXPIRE s06-exp 1
+SLEEP 1.2
+LLEN s06-exp
+LRANGE s06-exp 0 -1
+LPOP s06-exp
+RPOP s06-exp 2
+EXISTS s06-exp
+
+# 기존 SET 옵션과 타입 교체
+RPUSH s06-overwrite a b
+EXPIRE s06-overwrite 60
+SET s06-overwrite no NX
+LRANGE s06-overwrite 0 -1
+TTL s06-overwrite
+SET s06-overwrite yes XX
+GET s06-overwrite
+TTL s06-overwrite
+rpush s06-empty 한글 값
+llen s06-empty
+lrange s06-empty 0 -1
+lpop s06-empty
+rpop s06-empty
+EXISTS s06-empty
+DEL s06-all s06-bad s06-exp s06-overwrite
